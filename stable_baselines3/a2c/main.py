@@ -27,14 +27,24 @@ def breakout():
         frameskip=4, repeat_action_probability=0.25), max_episode_steps=60000)), 4)
 
 
+def conv(in_features, out_features, kernel_size=3, stride=1, padding=1):
+    return torch.nn.Sequential(
+        torch.nn.Conv2d(in_features, out_features, kernel_size=kernel_size, stride=stride, padding=padding),
+        # torch.nn.BatchNorm2d(out_features),
+        torch.nn.ReLU())
+
+
 class ActorCritic(torch.nn.Module):
     def __init__(self, state_dim, n_alternatives):
         """n_alternatives == 1 -> Normal"""
         super().__init__()
-        self.c1 = torch.nn.Conv2d(state_dim, 32, kernel_size=8, stride=4, padding=4)
-        self.c2 = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=2)
-        self.c3 = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
-        self.fc1 = torch.nn.Linear(7680, 512)
+        self.extractor = torch.nn.Sequential(
+            conv(state_dim, 32, kernel_size=8, stride=4, padding=4),
+            conv(32, 64, kernel_size=4, stride=2, padding=2),
+            conv(64, 64),
+            torch.nn.Flatten(),
+            torch.nn.Linear(7680, 512),
+            torch.nn.ReLU())
         self.actor = torch.nn.Linear(512, n_alternatives)
         self.critic = torch.nn.Linear(512, 1)
 
@@ -42,59 +52,37 @@ class ActorCritic(torch.nn.Module):
 
     def forward(self, state):
         # TODO Mish, BatchNorm
-        conved = torch.flatten(torch.nn.functional.relu(self.c3(torch.nn.functional.relu(self.c2(torch.nn.functional.relu(self.c1(state)))))), 1)
-        features = torch.nn.functional.relu(self.fc1(conved))
-        return torch.distributions.Categorical(logits=self.actor(features)), self.critic(features)
+        features = self.extractor(state)
+        return torch.distributions.Categorical(logits=self.actor(features)), self.critic(features).squeeze()
 
 
-def transpose_reshape(x):
-    return x.transpose(0, 1).reshape(x.shape[0] * x.shape[1], *x.shape[2:])
-
-
-def train_step(mem, last_values, last_dones, policy, device, gamma, gae_lambda):
-    observations, actions, rewards, dones, values, log_probs = mem
+def train_step(states, dists, actions, rewards, dones, policy, gamma):
+    LAMBDA = 0.92
+    act_losses = []
+    critic_losses = []
     gae = 0.0
-    advantages = []
-    next_value = last_values
-    next_done = last_dones
-    for step_id in reversed(range(len(observations))):
-        delta = rewards[step_id] + gamma * (1.0 - next_done) * next_value - values[step_id]
-        gae = delta + gamma * gae_lambda * (1.0 - next_done) * gae
-        advantages.append(gae)
-        next_value = values[step_id]
-        next_done = dones[step_id]
-    advantages.reverse()
+    with torch.no_grad():
+        _, next_value = policy(states[-1])
+        next_dones = dones[-1]
+    for step_id in reversed(range(len(states) - 1)):  # TODO without for loop, but I need to build multidimensional dists
+        _, values = policy(states[step_id])
+        detached_values = values.detach()
+        delta = rewards[step_id] + (1.0 - next_dones) * gamma * next_value - detached_values
+        gae = delta + gamma * LAMBDA * (1.0 - next_dones) * gae
+        critic_losses.append(torch.nn.functional.mse_loss(values, gae + detached_values))  # TODO TD(lambda)
+        log_prob = dists[step_id].log_prob(actions[step_id])
+        act_losses.append(-1e-2 * dists[step_id].entropy().mean() - (log_prob * gae).mean())
+        next_value = detached_values
+        next_dones = dones[step_id]
 
-    actions = transpose_reshape(torch.stack(actions))
-    observations = transpose_reshape(torch.stack(observations))
-    advantages = transpose_reshape(torch.stack(advantages))
-    rb_values = transpose_reshape(torch.stack(values))
-    returns = advantages + rb_values
+    critic_loss = torch.stack(critic_losses).mean()
+    loss = torch.stack(act_losses).mean() + 0.25 * critic_loss
 
-    actions = actions.long().flatten()
-
-    distr, values = policy(observations)
-    log_prob = distr.log_prob(actions)
-    entropy = distr.entropy()
-    values = values.flatten()
-
-    # Policy gradient loss
-    policy_loss = -(advantages * log_prob).mean()
-
-    # Value loss using the TD(gae_lambda) target
-    value_loss = torch.nn.functional.mse_loss(returns, values)
-    entropy_loss = -entropy.mean()
-
-    loss = policy_loss + 0.01 * entropy_loss + 0.25 * value_loss  # TODO try 1 as value_loss coeff
-
-    # Optimization step
     policy.optimizer.zero_grad()
     loss.backward()
-
-    # Clip grad norm
     torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)  # TODO does it work without it?
     policy.optimizer.step()
-    return value_loss.item()
+    return critic_loss.item()
 
 
 def main():
@@ -107,30 +95,25 @@ def main():
     last_scores = []
     losses = []
 
-    observations = envs.reset()
-    prev_dones = np.zeros((envs.num_envs,), dtype=np.bool)
-    mem = [], [], [], [], [], []  # obs, actions, rewards, dones, values, log_probs
-    writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime('logs/main/%d-%m-%Y %H-%M'))
+    states = torch.as_tensor(envs.reset(), dtype=torch.float32, device=DEVICE)
+    prev_dones = torch.zeros((envs.num_envs,), dtype=torch.float32, device=DEVICE)
+    mem = [], [], [], [], []  # obs, actions, rewards, dones, values, log_probs
+    writer = tensorboard.SummaryWriter(datetime.datetime.now().strftime('logs/%d-%m-%Y %H-%M'))
     for step_id in itertools.count():
-        obs_tensor = torch.as_tensor(observations, dtype=torch.float32, device=DEVICE)
+        dist, _ = policy(states)
         with torch.no_grad():
-            distr, values = policy(obs_tensor)
-        actions = distr.sample()
-        log_probs = distr.log_prob(actions)
-        actions = actions.cpu().numpy()
-
-        new_obs, rewards, dones, infos = envs.step(actions)
-
-        # Reshape in case of discrete action
-        actions = actions.reshape(-1, 1)
-        mem[0].append(obs_tensor)
-        mem[1].append(torch.as_tensor(actions, device=DEVICE))
-        mem[2].append(torch.as_tensor(rewards, device=DEVICE))
-        mem[3].append(torch.as_tensor(prev_dones, dtype=torch.float32, device=DEVICE))
-        mem[4].append(values.squeeze())
-        mem[5].append(log_probs)
-        observations = new_obs
-        prev_dones = dones
+            actions = dist.sample()
+        next_observations, rewards, dones, diagnostic_infos = envs.step(actions.cpu().numpy())
+        next_states = torch.as_tensor(next_observations, dtype=torch.float32, device=DEVICE)
+        tensor_rewards = torch.as_tensor(rewards, dtype=torch.float32, device=DEVICE)
+        tensor_dones = torch.as_tensor(dones.astype(np.float32), dtype=torch.float32, device=DEVICE)
+        mem[0].append(states)
+        mem[1].append(dist)
+        mem[2].append(actions)
+        mem[3].append(tensor_rewards)
+        mem[4].append(prev_dones)
+        prev_dones = tensor_dones
+        states = next_states
 
         current_scores += rewards
         if dones.any():
@@ -146,11 +129,11 @@ def main():
                 losses = []
 
         if len(mem[0]) > 5:
-            with torch.no_grad():
-                _, last_value = policy(torch.as_tensor(new_obs, dtype=torch.float32, device=DEVICE))
-            loss = train_step(mem, last_value.squeeze(), torch.as_tensor(dones, dtype=torch.float32, device=DEVICE), policy, DEVICE, GAMMA, 0.92)
-            mem = [], [], [], [], [], []
-            losses.append(loss)
+            mem[0].append(next_states)
+            mem[4].append(tensor_dones)
+            critic_loss = train_step(*mem, policy, GAMMA)
+            losses.append(critic_loss)
+            mem = [], [], [], [], []
 
 
 if __name__ == '__main__':
